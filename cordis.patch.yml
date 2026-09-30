@@ -1,0 +1,20 @@
+# ============================================================================
+# dsh-theme-studio —— DSH bundle patch
+# ============================================================================
+# 本文件是该插件的“挂载声明”。DSH 启动时按 bundle 层栈叠加各插件 patch，
+# 这里把插件作为一个 Loader 行插入 Web profile 的配置树。
+#
+# 安装：
+#   dsh plugin --profile web add link:<本目录绝对路径>
+# 或从 GitHub / npm：
+#   dsh plugin --profile web add dsh-theme-studio
+#
+# 同一行同时承担两件事：
+#   1) Node 半侧（lib/index.js）：注册 /theme-studio/* 的宿主 API 路由；
+#   2) 浏览器半侧（lib/client.js）：由 package.json 的 dsh.client 声明，
+#      被 client-modules 扫描进 window.__DSH_BOOT__，在浏览器里加载。
+# ============================================================================
+
+- insert:
+    - id: dsh-theme-studio
+      name: dsh-theme-studio

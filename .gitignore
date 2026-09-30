@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# 探针与侦察脚本的产物（截图 / 日志 / 临时报告）
+browser-*.txt
+scout-out.txt
+scout-report.json
+bg-report.txt
+pixels.txt
+*.log
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地环境
+.env
+.env.local

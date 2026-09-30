@@ -1,0 +1,45 @@
+{
+  "name": "dsh-theme-studio",
+  "version": "0.2.6",
+  "description": "DSH Web 界面主题工作室：本地文件夹/URL 壁纸背景、分区独立毛玻璃、RGB 自定义主题色与预设",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "theme",
+    "wallpaper",
+    "glassmorphism"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/songcheng-ya/dsh-theme-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/songcheng-ya/dsh-theme-studio/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "external": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "license": "MIT"
+}
