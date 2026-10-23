@@ -1,6 +1,6 @@
 {
   "name": "dsh-theme-studio",
-  "version": "0.2.6",
+  "version": "1.0.0",
   "description": "DSH Web 界面主题工作室：本地文件夹/URL 壁纸背景、分区独立毛玻璃、RGB 自定义主题色与预设",
   "keywords": [
     "dsh",
@@ -11,6 +11,9 @@
     "glassmorphism"
   ],
   "type": "module",
+  "scripts": {
+    "check": "node tools/check-undeclared.mjs && node tools/check-contract.mjs && node tools/check-migration.mjs && node tools/check-host.mjs && node tools/check-client.mjs && node tools/smoke-client.mjs"
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -36,10 +39,11 @@
     "client": {
       "platform": "web",
       "immediately": true,
-      "external": [
-        "@deepseek-ai/dsh-client-ui-settings"
-      ]
+      "external": []
     }
+  },
+  "engines": {
+    "node": ">=20"
   },
   "license": "MIT"
 }
