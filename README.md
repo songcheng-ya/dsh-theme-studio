@@ -27,6 +27,12 @@
 
 “分区命中自检”会列出各分区样式选择器的命中数量，帮助判断 DSH 更新后某个毛玻璃效果是否失效。维护操作包括重新扫描目录、重选随机壁纸、一键关闭并复原、重置全部配置，以及仅清理上传副本和远程图片缓存；重置和清理操作需要再次确认。关闭插件会保留设置，重置配置才会恢复出厂值；单独清理本地缓存不会删除已登记目录中的原图。
 
+## 安装命令
+npx @deepseek-ai/dsh plugin --profile web add "link:该插件解压后的路径"
+以C:\Users\Public\Downloads举例，那么安装命令就是npx @deepseek-ai/dsh plugin --profile web add "link:C:\Users\Public\Downloads"
+
+
+
 
 本插件及使用说明均由 AI 生成。若发现 Bug 或有任何疑问，请前往bilibili与我联系。
 
