@@ -308,8 +308,9 @@ await guard.run(async () => {
     afterReset.wallpaper.source === 'none' && (afterReset.wallpaper.folders ?? []).length === 0 &&
       afterReset.wallpaper.fixed === '' && afterReset.wallpaper.dim === 0,
     JSON.stringify({ source: afterReset.wallpaper.source, folders: afterReset.wallpaper.folders, dim: afterReset.wallpaper.dim }))
-  check('★★ 玻璃回到出厂（不透明度 1、模糊 0）',
-    ['bars', 'input', 'bubble', 'menu'].every((key) => afterReset.glass[key].opacity === 1 && afterReset.glass[key].blur === 0),
+  check('★★ 玻璃回到出厂（不透明度 1、模糊 0、颜色随主题）',
+    ['bars', 'input', 'bubble', 'assistant', 'menu'].every((key) =>
+      afterReset.glass[key].opacity === 1 && afterReset.glass[key].blur === 0 && afterReset.glass[key].color === 'auto'),
     JSON.stringify(afterReset.glass))
   check('★★ 主题色回到关闭状态', afterReset.accent.enabled === false, JSON.stringify(afterReset.accent))
   check('★ 总开关回到 true（重置 ≠ 关闭）', afterReset.enabled === true, String(afterReset.enabled))

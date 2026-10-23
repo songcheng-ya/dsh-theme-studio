@@ -96,7 +96,7 @@ check('宿主配置里没有任何分区带 saturation',
   regionKeys.map((key) => `${key}:${Object.keys(config.glass[key]).join('/')}`).join('  '))
 check('宿主配置里没有 perf 键', !('perf' in config), Object.keys(config).join(','))
 /* 分区数会随每次增删变化，所以这里不写死数字 —— 只断言「现存的一个不少、旧键一个不留」。 */
-const EXPECTED_REGIONS = ['bars', 'input', 'bubble', 'menu']
+const EXPECTED_REGIONS = ['bars', 'input', 'bubble', 'assistant', 'menu']
 const REMOVED_REGIONS = ['sidebar', 'topbar', 'chat', 'panel']
 check(`宿主配置里只剩 ${EXPECTED_REGIONS.length} 个分区` +
   '（sidebar/topbar 0.1.15 合并为 bars；chat 0.1.13、panel 0.1.14 删）',

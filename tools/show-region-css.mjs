@@ -4,7 +4,7 @@
  * 用法：node tools/show-region-css.mjs [region] [opacity] [blur]
  *   例：node tools/show-region-css.mjs input 0.58 20
  *
- * region 取 REGION_SELECTORS 的键：chat / input / bubble / panel / menu。
+ * region 取 REGION_SELECTORS 的键：bars / input / bubble / assistant / menu。
  * （`sidebar` 0.1.9 删、`topbar` 0.1.12 删，传它们只会打印空结果。）
  */
 

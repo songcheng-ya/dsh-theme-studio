@@ -11,7 +11,7 @@
  *      也是这次改用伪元素的唯一原因，必须每次回归都验。
  *   3. **两处实色被剥掉**（`.pI_x6G_sidebarCol` 与 `.hHd-Xa_root`），
  *      否则伪元素背后是平色，模糊看不出来 —— 会退化成「只有控件有边界」的老故障。
- *   4. 分区关闭后**一切复原**：元素回到原生底色、伪元素不再输出。
+   *   4. 分区关闭且壁纸仍启用：顶边栏恢复原生明暗底色，主区依然透出壁纸。
  *
  * 用法：node tools/probe-bars.mjs <token> <port>
  */
@@ -118,7 +118,7 @@ const SNAPSHOT = `(() => {
   const overlay = document.querySelector('.VOzbGW_overlay')
   const mask = document.querySelector('.VOzbGW_mask')
   const panel = document.querySelector('.VOzbGW_panel')
-  const SELF = ['position', 'zIndex', 'backgroundColor', 'backdropFilter', 'filter', 'transform']
+   const SELF = ['position', 'zIndex', 'isolation', 'backgroundColor', 'backdropFilter', 'filter', 'transform']
   const PSEUDO = ['content', 'position', 'inset', 'zIndex', 'backgroundColor', 'backdropFilter', 'pointerEvents']
   const desc = (el) => el === null ? null : el.tagName.toLowerCase() +
     (el.id ? '#' + el.id : '') + [...el.classList].slice(0, 2).map((c) => '.' + c).join('')
@@ -197,9 +197,13 @@ const SNAPSHOT = `(() => {
 
   return {
     viewport: [innerWidth, innerHeight],
+    darkTheme: document.body.hasAttribute('data-ds-dark-theme') || document.documentElement.hasAttribute('data-ds-dark-theme'),
     sidebar: { rect: rect(sidebar), self: styleOf(sidebar, SELF), before: styleOf(sidebar, PSEUDO, '::before') },
-    header: { rect: rect(header), self: styleOf(header, SELF), before: styleOf(header, PSEUDO, '::before') },
+    header: { rect: rect(header), self: styleOf(header, SELF), before: styleOf(header, PSEUDO, '::before'),
+      parent: styleOf(header?.parentElement, ['backgroundColor']) },
     sidebarCol: styleOf(sidebarCol, ['backgroundColor', 'position', 'zIndex']),
+    centerCol: styleOf(document.querySelector('.pI_x6G_centerCol'), ['backgroundColor']),
+    frame: styleOf(document.querySelector('.pI_x6G_frame'), ['backgroundColor']),
     dialog: { overlay: rect(overlay), mask: rect(mask), panel: rect(panel) },
     stacking,
     negativeZ,
@@ -268,10 +272,21 @@ console.log(`\n=== 阶段 A：边栏关闭 ===`)
 console.log(`  侧栏 ${JSON.stringify(off.before.sidebar.rect)}  自身底色=${off.before.sidebar.self.backgroundColor}  伪元素 content=${off.before.sidebar.before.content}`)
 console.log(`  顶边栏 自身底色=${off.before.header.self.backgroundColor}  伪元素 content=${off.before.header.before.content}`)
 console.log(`  侧栏外侧 .pI_x6G_sidebarCol 底色=${off.before.sidebarCol.backgroundColor}`)
+if (off.before.backgroundLayer !== null) {
+  const native = off.before.darkTheme ? 'rgb(21, 21, 23)' : 'rgb(255, 255, 255)'
+  check('关闭时：壁纸仍生效，顶边栏恢复 DSH 原生 bg-base 明暗底色',
+    off.before.header.self.backgroundColor === native, `${off.before.header.self.backgroundColor} vs ${native}`)
+  check('关闭时：只补顶边栏底色，不重新铺满会话根容器',
+    off.before.header.parent.backgroundColor === 'rgba(0, 0, 0, 0)' &&
+      off.before.centerCol.backgroundColor === 'rgba(0, 0, 0, 0)' &&
+      off.before.frame.backgroundColor === 'rgba(0, 0, 0, 0)',
+    `会话根=${off.before.header.parent.backgroundColor} 中心列=${off.before.centerCol.backgroundColor} frame=${off.before.frame.backgroundColor}`)
+}
 
-check('关闭时：侧栏回到 DSH 原生实色（#f9fafb）',
-  off.before.sidebar.self.backgroundColor === 'rgb(249, 250, 251)', off.before.sidebar.self.backgroundColor)
-check('关闭时：侧栏外侧那层也是原生实色', off.before.sidebarCol.backgroundColor === 'rgb(249, 250, 251)',
+const nativeSidebar = off.before.darkTheme ? 'rgb(27, 27, 28)' : 'rgb(249, 250, 251)'
+check('关闭时：侧栏回到 DSH 原生明暗实色',
+  off.before.sidebar.self.backgroundColor === nativeSidebar, off.before.sidebar.self.backgroundColor)
+check('关闭时：侧栏外侧那层也是原生明暗实色', off.before.sidebarCol.backgroundColor === nativeSidebar,
   off.before.sidebarCol.backgroundColor)
 check('关闭时：侧栏没有 ::before 内容', off.before.sidebar.before.content === 'none', off.before.sidebar.before.content)
 check('关闭时：顶边栏没有 ::before 内容', off.before.header.before.content === 'none', off.before.header.before.content)
@@ -302,6 +317,13 @@ check('顶边栏 ::before 同样带底色与模糊',
   headerBefore.content !== 'none' && headerBefore.backgroundColor === `rgba(255, 255, 255, ${OPACITY})` &&
     headerBefore.backdropFilter === `blur(${BLUR}px)`,
   `content=${headerBefore.content} 底色=${headerBefore.backgroundColor} 模糊=${headerBefore.backdropFilter}`)
+check('顶边栏将 -1 伪元素限制在自己的绘制上下文内，不隔离侧栏',
+  on.before.header.self.isolation === 'isolate' && on.before.sidebar.self.isolation === 'auto',
+  `顶边栏=${on.before.header.self.isolation} 侧栏=${on.before.sidebar.self.isolation}`)
+if (on.before.backgroundLayer !== null) {
+  check('顶边栏磨砂膜后方的会话根底色透明，可采到壁纸而不是平色',
+    on.before.header.parent.backgroundColor === 'rgba(0, 0, 0, 0)', on.before.header.parent.backgroundColor)
+}
 
 /* 2) 元素自身绝不带 backdrop-filter，且弹窗没被困住 */
 check('侧栏自身没有 backdrop-filter', on.before.sidebar.self.backdropFilter === 'none', on.before.sidebar.self.backdropFilter)
@@ -372,8 +394,9 @@ const scope = on.before.trajectorySplit
 console.log(`\n  --dsw-specific-sidebar-fill 的作用域：body=${scope.onBody}  侧栏=${scope.onSidebar}  中心列=${scope.onCenterCol}`)
 check('★ token 覆盖只落在侧栏内（侧栏 = transparent）',
   scope.onSidebar === 'transparent', String(scope.onSidebar))
-check('★ token 覆盖没有外溢（body 与中心列仍是原生 #f9fafb）',
-  scope.onBody === '#f9fafb' && scope.onCenterCol === '#f9fafb',
+const nativeSidebarToken = on.before.darkTheme ? '#1b1b1c' : '#f9fafb'
+check('★ token 覆盖没有外溢（body 与中心列仍是原生明暗侧栏色）',
+  scope.onBody === nativeSidebarToken && scope.onCenterCol === nativeSidebarToken,
   `body=${scope.onBody} 中心列=${scope.onCenterCol}`)
 
 /* ── 收尾：还原配置 ─────────────────────────────────────────────── */

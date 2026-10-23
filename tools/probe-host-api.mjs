@@ -61,7 +61,7 @@ check('config 写入成功', put.body?.ok === true, JSON.stringify(put.body?.con
 /* 判「现存分区的默认值都还在」。原来这里写的是 `glass.chat`，而 `chat`
  * 分区在 0.1.13 就删掉了（宿主 RETIRED_REGIONS 会持续剔除它的残键），
  * 于是这条断言必然失败 —— 是探针过期，不是插件坏了。改成遍历现存分区。 */
-const LIVE_REGIONS = ['bars', 'input', 'bubble', 'menu']
+const LIVE_REGIONS = ['bars', 'input', 'bubble', 'assistant', 'menu']
 const glass = put.body?.config?.glass ?? {}
 check('config 保留现存分区的默认值',
   LIVE_REGIONS.every((key) => typeof glass[key]?.blur === 'number' && typeof glass[key]?.opacity === 'number'),
@@ -90,17 +90,20 @@ if (first !== undefined) {
   const cached = await fetch(`${API}/image?path=${encodeURIComponent(first.path)}`, { headers: { 'if-none-match': etag } })
   check('image 支持 304 协商缓存', cached.status === 304, `status=${cached.status}`)
 
-  // 回归防线：`new URL().searchParams.get()` **不做百分号解码**，早期实现直接把它
-  // 当路径用，于是任何真的按 URL 编码传参的调用（也就是浏览器里的真实调用）都会
-  // 因为解码失败被误判为越权 —— 手测时用未编码路径会漏掉这个 bug，所以这里两种
-  // 形态都测，并且专门覆盖带空格与中文的路径。
+  // 回归防线（审计 P1 第 9 条）：`new URL().searchParams.get()` **已经做过一次
+  // 百分号解码**（WHATWG urlencoded 解析器还会把裸 `+` 当空格）。早期实现在它之后
+  // 又 decodeURIComponent 一次，结果文件名里真的含 `%20` 的图片被解成空格、403。
+  // 浏览器发出的路径是 encodeURIComponent 编码过一次的，所以编码形态必须可用；
+  // 同时保留未编码形态的断言：裸路径（手测/命令行）由 URL 解析器把空格等字符
+  // 规范化后再解一次，两种调用都应 200。真实 `+` 由 encodeURIComponent 编成 %2B，
+  // 不受 urlencoded 的 `+` → 空格语义影响。
   const rawPath = await fetch(`${API}/image?path=${first.path}`)
   check('未编码路径（含反斜杠）同样可用', rawPath.status === 200, `status=${rawPath.status}`)
 
   const tricky = path.join(folder, '含 空格 目录', '图 片.png')
   const trickyResult = await json(`${API}/image?path=${encodeURIComponent(tricky)}`)
   check('含空格与中文的编码路径解码正确', trickyResult.status === 403,
-    `status=${trickyResult.status}（403 = 已正确解码、只是文件不存在，而非解码失败误判越权）`)
+    `status=${trickyResult.status}（403 = 只解一次后路径正确、文件不存在，而非解码失败/越权）`)
 }
 
 /* ── 6. 安全边界：目录外的文件必须拒绝 ──────────────────────────── */

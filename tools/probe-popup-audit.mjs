@@ -4,12 +4,11 @@
  * 与 audit-popup.mjs 的分工：
  *   audit-popup.mjs  —— 静态 + 生成层（源码里有哪些、CSS 里生成了哪些）
  *   本脚本           —— 运行时（这些选择器在真实 DOM 上命中几个元素、
- *                       弹窗子树里到底有几个元素真的带上了 backdrop-filter）
+ *                       设置弹窗是否仍保留原生底色与模糊）
  *
  * 关键设计：**不改动落盘配置**。
- * 现网配置是「不透明度 100% / 模糊 0」，插件根本不会输出 backdrop-filter，
- * 直接量什么都量不到。所以这里在 Node 侧把最激进的 CSS（所有分区 opacity 0.5 /
- * blur 20）算好，用 CDP 临时注入一个 <style>，量完再删掉 —— 用户界面不受影响。
+ * 不依赖现网玻璃参数：在 Node 侧把所有分区 opacity 0.5 / blur 20 的 CSS
+ * 算好，用 CDP 临时注入一个 <style>，量完再删掉。不会改动落盘配置。
  *
  * 用法：node tools/probe-popup-audit.mjs <token> <port>
  */
@@ -297,14 +296,17 @@ const SNAPSHOT = `(() => {
     })
   }
 
-  /* 令牌的实际计算值 —— 这些就是「弹窗表面」的颜色来源。 */
-  const body = getComputedStyle(document.body)
-  const tokens = {}
-  for (const name of ['--dsw-alias-bg-layer-1', '--dsw-alias-bg-layer-2', '--dsw-alias-bg-layer-3',
-    '--dsw-alias-bg-overlay', '--dsw-specific-menu', '--dsw-specific-tip', '--dsw-specific-selector',
-    '--dsw-mask-blur', '--ds-ts-panel', '--ds-ts-menu']) {
-    tokens[name] = body.getPropertyValue(name).trim()
-  }
+   /* body 上的共享令牌不得随菜单调整；设置面板还要检查自身继承的值。 */
+   const body = getComputedStyle(document.body)
+   const panelComputed = panel ? getComputedStyle(panel) : null
+   const tokens = {}
+   const panelTokens = {}
+   for (const name of ['--dsw-alias-bg-layer-1', '--dsw-alias-bg-layer-2', '--dsw-alias-bg-layer-3',
+     '--dsw-alias-bg-overlay', '--dsw-specific-menu', '--dsw-specific-tip', '--dsw-specific-selector',
+     '--dsw-mask-blur', '--ds-ts-panel', '--ds-ts-menu']) {
+     tokens[name] = body.getPropertyValue(name).trim()
+     panelTokens[name] = panelComputed?.getPropertyValue(name).trim() ?? ''
+   }
 
   /* 弹窗与遮罩自身的计算样式。 */
   const styleOf = (el, props) => {
@@ -314,13 +316,14 @@ const SNAPSHOT = `(() => {
   }
 
   return {
-    blurred,
-    tokens,
+     blurred,
+     tokens,
+     panelTokens,
     panelStyle: styleOf(panel, ['backgroundColor', 'backdropFilter', 'position']),
     maskStyle: styleOf(mask, ['backgroundColor', 'backdropFilter', 'position']),
     overlayStyle: styleOf(overlay, ['backdropFilter', 'position']),
     sidebarStyle: styleOf(sidebar, ['backgroundColor', 'backdropFilter']),
-    /* 面板里那个删除按钮自带 backdrop-filter —— 面板层唯一的模糊。 */
+     /* 插件的壁纸删除按钮可能自带模糊，不应被误算作菜单新引入的模糊。 */
     thumbDelStyle: styleOf(document.querySelector('.ds-ts-thumb-del'), ['backdropFilter', 'backgroundColor']),
     cards: [...document.querySelectorAll('.ds-ts-card .ds-ts-title')].map((el) => el.textContent.trim()),
   }
@@ -361,9 +364,10 @@ for (const item of hits.__fallback) {
   console.log(`    ${String(item.count).padStart(4)} × ${item.selector}${item.sample.length > 0 ? `   → ${item.sample.join('  ')}` : ''}`)
 }
 
-console.log('\n══ 注入前：弹窗相关计算值（现网配置 = 全 opaque）══\n')
+console.log('\n══ 注入前：弹窗相关计算值（现网配置）══\n')
 const before = await evaluate(SNAPSHOT)
 console.log(`  令牌：${JSON.stringify(before.tokens, null, 0)}`)
+console.log(`  面板令牌：${JSON.stringify(before.panelTokens, null, 0)}`)
 console.log(`  面板 ${JSON.stringify(before.panelStyle)}`)
 console.log(`  遮罩 ${JSON.stringify(before.maskStyle)}`)
 console.log(`  带 backdrop-filter 的元素数：${before.blurred.length}`)
@@ -383,6 +387,7 @@ await sleep(600)
 console.log('\n══ 注入后：把**所有现存分区**都拉到 不透明度 0.5 / 模糊 20px ══\n')
 const after = await evaluate(SNAPSHOT)
 console.log(`  令牌：${JSON.stringify(after.tokens, null, 0)}`)
+console.log(`  面板令牌：${JSON.stringify(after.panelTokens, null, 0)}`)
 console.log(`  面板 ${JSON.stringify(after.panelStyle)}`)
 console.log(`  遮罩 ${JSON.stringify(after.maskStyle)}`)
 console.log(`  弹层容器 ${JSON.stringify(after.overlayStyle)}`)
@@ -403,21 +408,27 @@ for (const [where, list] of Object.entries(byWhere)) {
 /* ── 判定 ───────────────────────────────────────────────────────── */
 console.log('\n══ 判定 ══\n')
 
-const dialogBlur = after.blurred.filter((item) => item.where === '设置弹窗' || item.where === '弹窗遮罩层')
-check('弹窗子树里确实存在插件的模糊（说明这块代码是活的，不是残留）', dialogBlur.length > 0,
-  `${dialogBlur.length} 个元素：${dialogBlur.map((item) => item.el).join(', ')}`)
-check('侧栏仍然 0 个模糊元素（0.1.9 的删除仍然干净）',
+const dialogBlur = (snapshot) => snapshot.blurred
+  .filter((item) => item.where === '设置弹窗' || item.where === '弹窗遮罩层')
+  .map((item) => `${item.where}/${item.el}/${item.value}`).sort()
+check('调节所有玻璃分区后，设置弹窗及遮罩没有新增模糊元素',
+  JSON.stringify(dialogBlur(after)) === JSON.stringify(dialogBlur(before)),
+  `${JSON.stringify(dialogBlur(before))} → ${JSON.stringify(dialogBlur(after))}`)
+check('侧栏元素自身没有 backdrop-filter（边栏模糊由伪元素承担）',
   after.blurred.filter((item) => item.where === '侧栏').length === 0,
   String(after.blurred.filter((item) => item.where === '侧栏').length))
-check('设置遮罩的模糊令牌已被插件接管', String(after.tokens['--dsw-mask-blur']).includes('20px'),
-  String(after.tokens['--dsw-mask-blur']))
-check('弹窗表面令牌已被插件接管（bg-layer-1 / bg-overlay）',
-  after.tokens['--dsw-alias-bg-layer-1'].includes('0.5') && after.tokens['--dsw-alias-bg-overlay'].includes('0.5'),
-  `${after.tokens['--dsw-alias-bg-layer-1']} / ${after.tokens['--dsw-alias-bg-overlay']}`)
-check('弹层令牌已被插件接管（bg-layer-2 / -3 / specific-menu）',
-  after.tokens['--dsw-alias-bg-layer-2'].includes('0.5') && after.tokens['--dsw-alias-bg-layer-3'].includes('0.5') &&
-    after.tokens['--dsw-specific-menu'].includes('0.5'),
-  `${after.tokens['--dsw-alias-bg-layer-2']} / ${after.tokens['--dsw-specific-menu']}`)
+const nativeTokens = ['--dsw-mask-blur', '--dsw-alias-bg-layer-1', '--dsw-alias-bg-overlay',
+  '--dsw-alias-bg-layer-2', '--dsw-alias-bg-layer-3',
+  '--dsw-specific-menu', '--dsw-specific-tip', '--dsw-specific-selector']
+check('body 及设置面板的共享令牌不受菜单半透明参数影响',
+  nativeTokens.every((name) => before.tokens[name] === after.tokens[name] &&
+    before.panelTokens[name] === after.panelTokens[name]),
+  nativeTokens.filter((name) => before.tokens[name] !== after.tokens[name] ||
+    before.panelTokens[name] !== after.panelTokens[name]).join(', ') || '均未变化')
+check('设置弹窗和遮罩仍保留注入前的背景与模糊',
+  ['backgroundColor', 'backdropFilter'].every((prop) => before.panelStyle?.[prop] === after.panelStyle?.[prop] &&
+    before.maskStyle?.[prop] === after.maskStyle?.[prop]),
+  `${JSON.stringify(before.panelStyle)} → ${JSON.stringify(after.panelStyle)}`)
 check('删除按钮自带的一层模糊与配置无关，恒定存在',
   String(after.thumbDelStyle?.backdropFilter) === String(before.thumbDelStyle?.backdropFilter),
   `${before.thumbDelStyle?.backdropFilter} → ${after.thumbDelStyle?.backdropFilter}`)
@@ -452,7 +463,7 @@ for (const item of DEAD_CANDIDATES) {
     reason = threePartPossible
       ? '属性兜底：类名格式上存在 `_xxx_`，只是当前 DOM 没有该元素'
       : '★ 真死选择器：全站没有任何类名符合 `_xxx_` 三段式，该兜底永远不可能命中'
-  } else if (item.region === 'bubble') reason = '条件未满足：当前会话没有消息气泡'
+  } else if (item.region === 'bubble' || item.region === 'assistant') reason = '条件未满足：当前会话没有对应消息气泡'
   else if (item.region === 'menu') reason = '条件未满足：本次探测没能点开对应弹层'
   else reason = '未分类'
   if (reason.startsWith('★')) trulyDead.push(item)

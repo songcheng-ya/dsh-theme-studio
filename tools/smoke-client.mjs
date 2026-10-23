@@ -13,6 +13,203 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const BUNDLE = path.resolve(HERE, '..', 'lib', 'client.js')
 const source = fs.readFileSync(BUNDLE, 'utf8')
 
+/**
+ * 剔除注释后的源码投影（字符串与模板字符串的内容原样保留）。
+ *
+ * 静态断言必须基于它：文件里刻意保留了不少「旧实现已废弃」的历史说明
+ * （例如 purgeCache 旧的 `await putConfig(before)`），直接搜 `source` 会让
+ * 注释替代码背书 —— 旧断言正是这样在实现改掉之后仍然假通过的。
+ *
+ * 不能按行过滤：块注释里不以 `*` 开头的中间行会漏删（CSS 注释就在模板字符串里，
+ * 中间行正是这种形状），行首恰好是 `*` 的代码行又会被误删。这里用一个无依赖的
+ * 小扫描器逐字符识别 `//`、块注释、单/双引号字符串、模板字符串与 `${}` 插值，
+ * 以及正则字面量（`/"/g` 这类正则里的引号不能把扫描器带偏）：
+ *   · 字符串内容原样保留 —— 界面文案（例如 `tr('重置配置')`）本来就在里面；
+ *   · 注释替换成换行，行结构不塌，`^` 锚点的正则仍然可靠；
+ *   · `//` 只在代码态才算注释，`'http://x//y'` 这种 URL 不会被截断。
+ *
+ * @param {string} text - 原始源码。
+ * @returns {string} 去掉注释的代码投影。
+ */
+function stripComments(text) {
+  const out = []
+  /** 模板/插值栈：template 表示模板正文，interp 表示 `${...}` 内部。 */
+  const stack = []
+  /** 上一个有效代码记号，用来区分除号与正则字面量起始的 `/`。 */
+  let previous = null
+  let index = 0
+
+  /** 原样复制 count 个字符（越界时自动截断）。 */
+  const copy = (count = 1) => {
+    while (count > 0 && index < text.length) {
+      out.push(text[index])
+      index += 1
+      count -= 1
+    }
+  }
+
+  /** 这些关键字后面期待一个表达式，所以可以紧跟正则字面量。 */
+  const REGEX_KEYWORDS = new Set([
+    'return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void',
+    'instanceof', 'yield', 'await', 'do', 'else',
+  ])
+
+  /** `/` 是除号还是正则起始？`a / b`、`f() / 2`、`x[0] / 2` 都是除号。 */
+  const regexCanStart = () => {
+    if (previous === null) return true
+    if (previous.kind === 'word') return REGEX_KEYWORDS.has(previous.value)
+    if (previous.kind === 'value') return false
+    return previous.value !== ')' && previous.value !== ']' && previous.value !== '}'
+  }
+
+  while (index < text.length) {
+    const top = stack[stack.length - 1]
+
+    // 模板字符串正文：除了转义、结尾反引号和 ${，其它字符（含 // 与 /*）都是数据。
+    if (top?.kind === 'template') {
+      const char = text[index]
+      if (char === '\\') copy(2)
+      else if (char === '`') {
+        copy()
+        stack.pop()
+        previous = { kind: 'value' }
+      } else if (char === '$' && text[index + 1] === '{') {
+        copy(2)
+        stack.push({ kind: 'interp', depth: 0 })
+        previous = null
+      } else copy()
+      continue
+    }
+
+    // 代码态（顶层或 ${} 插值内）：先处理两种注释。
+    if (text[index] === '/' && text[index + 1] === '/') {
+      while (index < text.length && text[index] !== '\n') index += 1
+      continue // 换行留给下一轮复制，行结构不变
+    }
+    if (text[index] === '/' && text[index + 1] === '*') {
+      index += 2
+      while (index < text.length && !(text[index] === '*' && text[index + 1] === '/')) {
+        if (text[index] === '\n') out.push('\n') // 块注释换成等量空行
+        index += 1
+      }
+      index = Math.min(index + 2, text.length)
+      continue
+    }
+
+    const char = text[index]
+
+    // 正则字面量整体复制，内部不再判注释 —— 否则 /"/g 里的引号会被当成字符串开头。
+    if (char === '/' && regexCanStart()) {
+      copy()
+      let inClass = false
+      while (index < text.length) {
+        const current = text[index]
+        if (current === '\\') {
+          copy(2)
+          continue
+        }
+        if (current === '[') inClass = true
+        else if (current === ']') inClass = false
+        else if (current === '/' && !inClass) {
+          copy()
+          break
+        } else if (current === '\n') break // 非法正则，别吞掉后面的代码
+        copy()
+      }
+      while (index < text.length && /[a-z]/i.test(text[index])) copy() // flags
+      previous = { kind: 'value' }
+      continue
+    }
+
+    if (char === "'" || char === '"') {
+      const quote = char
+      copy()
+      while (index < text.length) {
+        if (text[index] === '\\') {
+          copy(2)
+          continue
+        }
+        const current = text[index]
+        copy()
+        if (current === quote) break
+      }
+      previous = { kind: 'value' }
+      continue
+    }
+    if (char === '`') {
+      copy()
+      stack.push({ kind: 'template' })
+      continue
+    }
+    if (/[A-Za-z_$]/.test(char)) {
+      let word = ''
+      while (index < text.length && /[A-Za-z0-9_$]/.test(text[index])) {
+        word += text[index]
+        out.push(text[index])
+        index += 1
+      }
+      previous = { kind: 'word', value: word }
+      continue
+    }
+    if (/[0-9]/.test(char)) {
+      while (index < text.length && /[0-9A-Za-z_.$]/.test(text[index])) {
+        out.push(text[index])
+        index += 1
+      }
+      previous = { kind: 'value' }
+      continue
+    }
+    if (top?.kind === 'interp') {
+      if (char === '{') {
+        top.depth += 1
+        copy()
+        previous = { kind: 'punct', value: '{' }
+        continue
+      }
+      if (char === '}') {
+        if (top.depth === 0) {
+          stack.pop()
+          copy()
+          previous = null // 回到模板正文，记号跟踪暂停
+          continue
+        }
+        top.depth -= 1
+        copy()
+        previous = { kind: 'punct', value: '}' }
+        continue
+      }
+    }
+    copy()
+    if (!/\s/.test(char)) previous = { kind: 'punct', value: char }
+  }
+
+  return out.join('')
+}
+
+const codeOnly = stripComments(source)
+
+/**
+ * 从 {@link codeOnly} 里截取一个顶层 `const X = ... => {` 的函数体。
+ *
+ * 边界取「下一个缩进不超过本声明的 const / let / var / return」：函数内部
+ * 嵌套的 const 缩进更深，不会被误截。截不到返回 null —— 调用方必须显式失败，
+ * 绝不能让 null 静默通过。
+ *
+ * @param text - 已剔除注释的源码投影。
+ * @param declaration - 声明前缀，例如 `const purgeCache = async () => {`。
+ * @returns 函数体文本；找不到声明或边界时返回 null。
+ */
+function sliceTopLevelBody(text, declaration) {
+  const start = text.indexOf(declaration)
+  if (start < 0) return null
+  const lineStart = text.lastIndexOf('\n', start) + 1
+  const indent = start - lineStart
+  const rest = text.slice(start + declaration.length)
+  const boundary = new RegExp(`\\n {0,${indent}}(?:const |let |var |return\\b)`).exec(rest)
+  if (boundary === null) return null
+  return rest.slice(0, boundary.index)
+}
+
 /* ── 最小 DOM 桩 ───────────────────────────────────────────────── */
 
 const created = []
@@ -206,10 +403,11 @@ const defaults = moduleExports.defaultConfig()
 const css = moduleExports.buildCss(defaults)
 check('CSS 非空', css.length > 500, `${css.length} chars`)
 check('CSS 含 token 覆盖', css.includes('--dsw-specific-input-major'))
-check('CSS 含外壳透明规则（玻璃生效的前提）', css.includes('.pI_x6G_frame { background: transparent'))
-check('分区选择器表含四个分区（0.1.15 起 sidebar + topbar 合并为 bars）',
-  Object.keys(moduleExports.REGION_SELECTORS).length === 4 &&
-    ['bars', 'input', 'bubble', 'menu'].every((key) => key in moduleExports.REGION_SELECTORS),
+check('未启用壁纸时保留 DSH 框架底色，不无条件把 frame 改透明',
+  !css.includes('.pI_x6G_frame { background: transparent'))
+check('分区选择器表含五个分区（AI 回复独立于用户气泡）',
+  Object.keys(moduleExports.REGION_SELECTORS).length === 5 &&
+    ['bars', 'input', 'bubble', 'assistant', 'menu'].every((key) => key in moduleExports.REGION_SELECTORS),
   Object.keys(moduleExports.REGION_SELECTORS).join(','))
 check('CSS 含暗色分支', css.includes('[data-ds-dark-theme]'))
 check('CSS 括号配平', (css.match(/\{/g) ?? []).length === (css.match(/\}/g) ?? []).length,
@@ -219,7 +417,14 @@ check('CSS 括号配平', (css.match(/\{/g) ?? []).length === (css.match(/\}/g) 
 check('出厂默认不产生任何模糊规则', !css.includes('backdrop-filter: blur'), '应为 0 条')
 check('出厂默认壁纸遮罩为 0（不暗化）', /--ds-ts-bg-dim, 0\)/.test(css))
 check('出厂默认暗角为 0', /--ds-ts-bg-vignette, 0\)/.test(css))
-check('出厂默认分区完全不透明', /--ds-ts-input: rgb\(255 255 255 \/ 1\.000\)/.test(css))
+check('出厂默认输入框沿用 DSH 原生配色及阴影描边',
+  css.includes('--ds-ts-input: var(--dsw-static-neutral-bluish-00)') &&
+    !css.includes('--dsw-elevation-soft:') && !css.includes('box-shadow: var(--ds-ts-inset)'))
+check('默认开启 AI 回复气泡但不模糊；可单独关闭',
+  defaults.glass.assistant.enabled === true && defaults.glass.assistant.opacity === 1 &&
+    defaults.glass.assistant.blur === 0 &&
+    css.includes('background: var(--ds-ts-assistant);') &&
+    !css.includes('backdrop-filter: blur('))
 
 /* 用户把不透明度拉起来后，才应该生成模糊规则。
  * 样本分区用 `input`：它同时有 `background` 与 `box-shadow` 两条声明，比 chat 更能
@@ -233,6 +438,76 @@ const glassy = moduleExports.buildCss({
 })
 check('调低不透明度后生成模糊规则', glassy.includes('backdrop-filter: blur(18px)'))
 check('调低不透明度后生成该分区的选择器', glassy.includes('.uV2eYG_card'))
+
+/* AI 提问与计划审批占用输入框的位置，背景已从输入框令牌获取不透明度；
+ * 两张卡片的直接子 section 还须单独获得同一模糊参数，不能顺手覆盖原生阴影。 */
+const inputTakeovers = ['[data-question-key] > section', '[data-plan-review-key] > section']
+const ruleFor = (stylesheet, selector) => stylesheet.split('}').find((rule) => {
+  const brace = rule.indexOf('{')
+  return brace >= 0 && rule.slice(0, brace).includes(`] ${selector}`)
+})?.split('{')[1] ?? ''
+check('提问与计划审批卡片纳入输入框自检，而非弹层菜单分区',
+  inputTakeovers.every((selector) => moduleExports.REGION_SELECTORS.input.includes(selector) &&
+    !moduleExports.REGION_SELECTORS.menu.includes(selector)))
+for (const selector of inputTakeovers) {
+  const rule = ruleFor(glassy, selector)
+  check(`${selector} 跟随输入框的 18px 模糊（含 WebKit）`,
+    rule.includes('backdrop-filter: blur(18px);') && rule.includes('-webkit-backdrop-filter: blur(18px);'), rule)
+  check(`${selector} 保留 DSH 自身的背景与阴影`,
+    !/\bbackground(?:-color)?\s*:|\bbox-shadow\s*:/.test(rule), rule)
+}
+
+/* DSH assistant-step 的根容器渲染 AI 正文，工具行/用户消息不走该节点；
+ * 只给回复（或未分组的助手输出）加左侧气泡，不把 reasoning 分组当成正文。 */
+const assistantSelectors = moduleExports.REGION_SELECTORS.assistant
+const assistantOnlyCss = moduleExports.buildCss({
+  ...defaults,
+  glass: { ...defaults.glass, assistant: { enabled: true, opacity: 0.42, blur: 27 } },
+})
+check('AI 回复分区使用 assistant-step 标记，覆盖原生与插槽包裹两种结构',
+  assistantSelectors.length === 2 && assistantSelectors.every((selector) =>
+    selector.startsWith('[data-chat-flow-kind="assistant-step"]:not([data-chat-group-part="reasoning"]) > ') &&
+    selector.includes('[class*="_root"]:has(> [class*="_body"])')) &&
+    assistantSelectors.some((selector) => selector.includes('[data-slot="conversation.chat.node"]')))
+check('AI 气泡有独立浅色/深色底色、圆角和留白，且不裁切宽表格',
+  assistantOnlyCss.includes('--ds-ts-assistant: color-mix(in srgb, var(--dsw-static-neutral-bluish-00) 42.0%, transparent)') &&
+    assistantOnlyCss.includes('--ds-ts-assistant: color-mix(in srgb, var(--dsw-static-neutral-bluish-950) 42.0%, transparent)') &&
+    assistantSelectors.every((selector) => {
+      const rule = ruleFor(assistantOnlyCss, selector)
+      return rule.includes('background: var(--ds-ts-assistant);') &&
+        rule.includes('border-radius: var(--dsw-radius-xl);') &&
+        rule.includes('padding: 10px 16px;') && !rule.includes('overflow: hidden')
+    }))
+check('AI 回复透明时只在助手容器上施加模糊（含 WebKit）',
+  assistantSelectors.every((selector) => assistantOnlyCss.split('}').some((rule) =>
+    rule.includes(`] ${selector}`) && rule.includes('backdrop-filter: blur(27px);') &&
+    rule.includes('-webkit-backdrop-filter: blur(27px);'))))
+const assistantOffCss = moduleExports.buildCss({
+  ...defaults,
+  glass: { ...defaults.glass, assistant: { enabled: false, opacity: 0.42, blur: 27 } },
+})
+check('关闭 AI 气泡即还原 DSH 原本的无气泡正文',
+  !assistantOffCss.includes('--ds-ts-assistant') &&
+    assistantSelectors.every((selector) => !assistantOffCss.includes(selector)))
+const assistantOpaqueCss = moduleExports.buildCss({
+  ...defaults,
+  glass: { ...defaults.glass, assistant: { enabled: true, opacity: 1, blur: 27 } },
+})
+check('AI 气泡完全不透明时不生成模糊规则',
+  !assistantOpaqueCss.includes('backdrop-filter: blur(27px)'))
+check('只调 AI 回复时不改用户消息气泡令牌；用户气泡有独立参数',
+  assistantOnlyCss.includes('--ds-ts-bubble: var(--dsw-static-deepseek-50)') &&
+    !assistantOnlyCss.includes('--ds-ts-bubble: color-mix(') &&
+    !moduleExports.REGION_SELECTORS.bubble.some((selector) =>
+      assistantOnlyCss.split('}').some((rule) => rule.includes(`] ${selector}`) && rule.includes('blur(27px)'))))
+const userOnlyCss = moduleExports.buildCss({
+  ...defaults,
+  glass: { ...defaults.glass, bubble: { enabled: true, opacity: 0.37, blur: 19 } },
+})
+check('只调用户消息时 AI 回复仍保持原不透明度且不模糊',
+  userOnlyCss.includes('--ds-ts-assistant: var(--dsw-static-neutral-bluish-00)') &&
+    assistantSelectors.every((selector) => !userOnlyCss.split('}').some((rule) =>
+      rule.includes(`] ${selector}`) && rule.includes('blur(19px)'))))
 
 const accentCss = moduleExports.buildCss({
   ...defaults,
@@ -251,6 +526,25 @@ check(
   '不透明度=100% 时不输出该分区的 blur',
   !/\.uV2eYG_card \{[^}]*backdrop-filter: blur/.test(opaqueCss),
 )
+check('输入框不透明时，提问与计划审批卡片都不浪费模糊开销',
+  inputTakeovers.every((selector) => ruleFor(opaqueCss, selector) === ''))
+const menuOnlyCss = moduleExports.buildCss({
+  ...defaults,
+  glass: {
+    ...defaults.glass,
+    input: { enabled: true, opacity: 1, blur: 18 },
+    menu: { enabled: true, opacity: 0.5, blur: 33 },
+  },
+})
+check('弹层菜单参数不会误控制 AI 提问卡片的模糊',
+  inputTakeovers.every((selector) => ruleFor(menuOnlyCss, selector) === ''))
+const disabledInputCss = moduleExports.buildCss({
+  ...defaults,
+  glass: { ...defaults.glass, input: { enabled: false, opacity: 0.5, blur: 18 } },
+})
+check('输入框分区关闭时，提问与计划审批卡片都还原原生效果',
+  inputTakeovers.every((selector) => ruleFor(disabledInputCss, selector) === '') &&
+    !disabledInputCss.includes('--dsw-specific-input-major:'))
 
 /* ── 回归（0.1.11）：去掉「画质档位」，模糊上限提到 100px ────────────────
  *
@@ -412,7 +706,6 @@ function findComponentProps(tab, componentName) {
   const found = []
   stateOverride = { match: 'wallpaper', value: tab }
   const root = Section({ t: (key) => key })
-  stateOverride = undefined
   const seen = new Set()
   const walk = (node, depth) => {
     if (depth > 30 || node === null || node === undefined || typeof node !== 'object') return
@@ -421,16 +714,18 @@ function findComponentProps(tab, componentName) {
       return
     }
     if (typeof node.type === 'function') {
-      if (node.type.name === componentName) found.push(node.props ?? {})
+      if (node.type.name === componentName) found.push({ ...(node.props ?? {}), render: node.type })
       if (seen.has(node.type)) return // 避免组件自递归
       seen.add(node.type)
-      walk(node.type({ ...(node.props ?? {}), t: (key) => key }), depth + 1)
+      // React.createElement 的 children 在桩里单独存着；Card 的正文由 children
+      // 参数传入，不补进 props 就只能看到标题、永远遍历不到里面的颜色控件。
+      walk(node.type({ ...(node.props ?? {}), children: node.children, t: (key) => key }), depth + 1)
       seen.delete(node.type)
       return
     }
     for (const child of [].concat(node.children ?? [])) walk(child, depth + 1)
   }
-  walk(root, 0)
+  try { walk(root, 0) } finally { stateOverride = undefined }
   return found
 }
 
@@ -455,8 +750,211 @@ check(
 const wallpaperText = texts.wallpaper
 check('壁纸页含中文标题', wallpaperText.includes('图片来源') && wallpaperText.includes('壁纸表现'), wallpaperText.slice(0, 120) || '(空)')
 check('壁纸页含候选卡片', wallpaperText.includes('壁纸候选'))
-check('玻璃页含四个分区名称（边栏 = 侧边栏 + 顶边栏）', ['边栏', '输入框', '气泡', '弹层菜单']
+check('玻璃页含五个分区名称（AI 回复与用户气泡分开）', ['边栏', '输入框', '气泡', 'AI 回复', '弹层菜单']
   .every((name) => texts.glass.includes(name)), texts.glass.slice(0, 120) || '(空)')
+const dimColorRows = findComponentProps('wallpaper', 'WallpaperDimColor')
+check('壁纸表现里遮罩暗化下方有独立的可展开选色入口',
+  dimColorRows.length === 1 && dimColorRows[0].color === 'auto' &&
+    typeof dimColorRows[0].onChange === 'function',
+  `rows=${dimColorRows.length} color=${dimColorRows[0]?.color}`)
+if (dimColorRows.length === 1) {
+  const row = dimColorRows[0]
+  const closed = row.render(row)
+  const toggle = closed.children[0]
+  check('选色默认收起；展开按钮可通过键盘和读屏识别',
+    toggle.type === 'button' && toggle.props['aria-expanded'] === 'false' &&
+      typeof toggle.props.onClick === 'function' &&
+      toggle.children.some((child) => child === '自定义遮罩颜色') &&
+      closed.children[1] === null)
+  stateOverride = { match: false, value: true }
+  const expanded = row.render(row)
+  stateOverride = undefined
+  const colorNode = expanded.children[1]?.children?.[0]
+  check('展开后才显示黑色预览、选色和恢复默认入口',
+    expanded.children[0].props['aria-expanded'] === 'true' &&
+      expanded.children[0].props['aria-controls'] === expanded.children[1]?.props?.id &&
+      colorNode?.type?.name === 'GlassColorRow' &&
+      colorNode.props.fallback === '#000000' &&
+      colorNode.props.defaultNote === '默认黑色')
+  if (colorNode?.type?.name === 'GlassColorRow') {
+    const chosen = []
+    const rendered = colorNode.type({ ...colorNode.props, onChange: (value) => chosen.push(value) })
+    const nativePicker = rendered.children[4].children[4].children[0]
+    nativePicker.props.onChange({ target: { value: '#78a2cf' } })
+    const custom = colorNode.type({ ...colorNode.props, color: '#78a2cf', onChange: (value) => chosen.push(value) })
+    custom.children[3].props.onClick()
+    check('选色写入十六进制 RGB，恢复默认写回 auto',
+      rendered.children[1].props.type === 'button' &&
+        nativePicker.props.type === 'color' && nativePicker.props.value === '#000000' &&
+        rendered.children[4].children[2] === null &&
+        rendered.children[3].props.disabled === true &&
+        custom.children[3].props.disabled === false &&
+        chosen.join(',') === '#78a2cf,auto')
+  }
+  const swatch = row.render({ color: '#78a2cf', onChange: row.onChange }).children[0].children[0]
+  check('收起时按钮色点也反映当前自定义遮罩颜色', swatch.props.style.backgroundColor === '#78a2cf')
+}
+const colorRows = findComponentProps('glass', 'GlassColorRow')
+check('五个不透明度分区各有独立的遮罩选色与恢复默认入口',
+  colorRows.length === 5 && colorRows.every((row) =>
+    row.label === '遮罩颜色' && row.color === 'auto' && /^#[0-9a-f]{6}$/.test(row.fallback) &&
+    typeof row.onChange === 'function' && row.presets?.light?.length === 3 && row.presets?.dark?.length === 3) &&
+    codeOnly.includes("popover: 'auto'") && codeOnly.includes("onClick: () => onChange('auto')") &&
+    codeOnly.includes('默认（侧栏、顶栏各用 DSH 原生色）') &&
+    codeOnly.includes('默认（沿用 DSH 原生半透明色，色块仅显示 RGB）') &&
+    codeOnly.includes('默认（取 DSH 页面底色；原生 AI 回复没有气泡）'),
+  `${colorRows.length} 个选色控件`)
+check('默认色块 RGB 对应 DSH 原生浅色配色（AI 回复取页面底色，菜单保留原生 alpha）',
+  colorRows.map((row) => row.fallback).join(',') === '#f9fafb,#ffffff,#edf3fe,#ffffff,#f8f9fa')
+const hexOf = (rgb) => `#${rgb.map((channel) => channel.toString(16).padStart(2, '0')).join('')}`
+check('五个分区的浅色和深色预设分别取 DSH 原生 RGB，不改自动模式',
+  colorRows.map((row) => hexOf(row.presets.light)).join(',') === '#f9fafb,#ffffff,#edf3fe,#ffffff,#f8f9fa' &&
+    colorRows.map((row) => hexOf(row.presets.dark)).join(',') === '#1b1b1c,#2c2c2e,#2c2c2e,#151517,#43454a' &&
+    colorRows.every((row) => row.color === 'auto'))
+const selectedPresets = colorRows.map((row) => {
+  const selected = []
+  const picker = row.render({ ...row, onChange: (value) => selected.push(value) })
+  const buttons = picker.children[4].children[2]?.children[0]
+  if (!Array.isArray(buttons)) return selected
+  for (const button of buttons) button.props.onClick()
+  return selected
+})
+check('每个分区首次点击浅色／深色预设都写入自己的固定颜色，不误写 auto',
+  colorRows.length === 5 && selectedPresets.every((selected, index) =>
+    selected.join(',') === [hexOf(colorRows[index].presets.light), hexOf(colorRows[index].presets.dark)].join(',')),
+  selectedPresets.map((colors) => colors.join(' → ')).join(' | '))
+if (colorRows.length > 0) {
+  const picked = []
+  const example = colorRows[0].render({ ...colorRows[0], color: '#aabbcc', onChange: (value) => picked.push(value) })
+  const [, picker, status, restore, popup] = example.children
+  const [field, hue, presetRow, rgbRow, nativeRow] = popup.children
+  nativeRow.children[0].props.onChange({ target: { value: '#123456' } })
+  restore.props.onClick()
+  check('自定义取色框保留系统取色入口，选色/恢复默认分别提交颜色与 auto',
+    picker.props.type === 'button' && popup.props.popover === 'auto' &&
+      nativeRow.children[0].props.type === 'color' && nativeRow.children[0].props.value === '#aabbcc' &&
+      picker.props['aria-labelledby'] && picker.props['aria-describedby'] === status.props.id &&
+      picker.props['aria-controls'] === popup.props.id &&
+      !restore.props.disabled &&
+      JSON.stringify(picked) === '["#123456","auto"]', JSON.stringify(picked))
+  const twoPresets = presetRow.children[0]
+  twoPresets[0].props.onClick()
+  twoPresets[1].props.onClick()
+  check('预设色块紧接色相条下方；点浅色/深色会写入固定 RGB，而不是 auto',
+    presetRow.props.className === 'ds-ts-color-presets' && hue.props.className === 'ds-ts-color-hue' &&
+      twoPresets.length === 2 && twoPresets[0].props['aria-label'].includes('#f9fafb') &&
+      twoPresets[1].props['aria-label'].includes('#1b1b1c') &&
+      picked.slice(-2).join(',') === '#f9fafb,#1b1b1c')
+  rgbRow.children[0][0].children[0].props.onChange({ target: { value: '128' } })
+  check('RGB 数字输入仍可手调任意颜色，颜色方块支持拖动和键盘',
+    picked.at(-1) === '#80bbcc' && field.props.role === 'slider' &&
+      typeof field.props.onPointerDown === 'function' && typeof field.props.onKeyDown === 'function' &&
+      hue.props.type === 'range')
+  const defaultPicker = colorRows[0].render(colorRows[0]).children
+  check('默认色取当前主题配色，恢复默认按钮在默认状态不可误点',
+    defaultPicker[1].children[0].props.style.backgroundColor === colorRows[0].fallback &&
+      defaultPicker[3].props.disabled === true &&
+      defaultPicker[4].children[2].children[0].every((button) => button.props['data-active'] === false))
+}
+
+const previewCss = head.children.find((tag) => tag.dataset.pluginCss === 'dsh-theme-studio/panel.css')?.textContent ?? ''
+check('预览 CSS 仅在本插件卡片拖动期间去掉 DSH 弹窗遮罩与模糊',
+  previewCss.includes('.VOzbGW_overlay:has(.ds-ts-page[data-ds-ts-preview]) .VOzbGW_mask { background: transparent !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }') &&
+    !previewCss.includes('--dsw-alias-bg-mask-1: transparent'))
+check('预览保留当前整张卡片，不改布局或移除其他卡片',
+  previewCss.includes('.ds-ts-page > :not(.ds-ts-tabpanel),') &&
+    previewCss.includes('.ds-ts-tabpanel > :not(.ds-ts-card[data-ds-ts-preview-card]) { visibility: hidden !important; }') &&
+    previewCss.includes('.VOzbGW_panel { background: transparent !important; box-shadow: none !important; }') &&
+    !previewCss.includes('.ds-ts-page > * { visibility: hidden !important; }') &&
+    !previewCss.includes('scrollbar-color: transparent transparent') &&
+    !previewCss.includes('display: none !important'))
+
+const previewRow = findComponentProps('glass', 'SliderRow').find((row) => row.label === '不透明度')
+if (previewRow !== undefined) {
+  const listeners = new Map()
+  const frames = new Map()
+  let nextFrame = 0
+  const oldAdd = window.addEventListener
+  const oldRemove = window.removeEventListener
+  const oldFrame = window.requestAnimationFrame
+  const oldCancelFrame = window.cancelAnimationFrame
+  window.addEventListener = (name, handler) => listeners.set(name, handler)
+  window.removeEventListener = (name, handler) => {
+    if (listeners.get(name) === handler) listeners.delete(name)
+  }
+  window.requestAnimationFrame = (callback) => {
+    nextFrame += 1
+    frames.set(nextFrame, callback)
+    return nextFrame
+  }
+  window.cancelAnimationFrame = (id) => frames.delete(id)
+  const advanceFrame = () => {
+    const current = [...frames.values()]
+    frames.clear()
+    for (const callback of current) callback()
+  }
+  const marked = () => {
+    const attrs = new Set()
+    return {
+      setAttribute: (name) => attrs.add(name),
+      removeAttribute: (name) => attrs.delete(name),
+      hasAttribute: (name) => attrs.has(name),
+    }
+  }
+  const overlay = {}
+  const page = { ...marked(), closest: (selector) => selector === '.VOzbGW_overlay' ? overlay : null }
+  const card = { ...marked(), closest: (selector) => selector === '.ds-ts-page' ? page : null }
+  const slider = { closest: (selector) => selector === '.ds-ts-card' ? card : null }
+  const values = []
+  const input = previewRow.render({ ...previewRow, onChange: (value) => values.push(value) }).children[1]
+  const previewActive = () => page.hasAttribute('data-ds-ts-preview') && card.hasAttribute('data-ds-ts-preview-card')
+  const previewOff = () => !page.hasAttribute('data-ds-ts-preview') && !card.hasAttribute('data-ds-ts-preview-card')
+  input.props.onPointerDown({ currentTarget: slider, button: 2, pointerId: 8 })
+  check('右键滑条不进入预览', previewOff())
+  input.props.onPointerDown({ currentTarget: slider, button: 0, pointerId: 8 })
+  check('第一次按下先保持控件原位，等待浏览器完成指针捕获', previewOff() && frames.size === 1)
+  input.props.onPointerUp({ currentTarget: slider, pointerId: 8 })
+  advanceFrame()
+  check('短点后松手会取消待执行的预览，不会留下透明设置界面', previewOff() && frames.size === 0 && listeners.size === 0)
+  input.props.onPointerDown({ currentTarget: slider, button: 0, pointerId: 8 })
+  input.props.onChange({ currentTarget: slider, target: { value: '0.24' } })
+  check('首次快速调整先于动画帧发生时，也在第一次变值时显示预览',
+    previewActive() && frames.size === 0 && values.at(-1) === 0.24)
+  input.props.onPointerUp({ currentTarget: slider, pointerId: 8 })
+  input.props.onPointerDown({ currentTarget: slider, button: 0, pointerId: 8 })
+  input.props.onBlur({ currentTarget: slider })
+  advanceFrame()
+  input.props.onChange({ currentTarget: slider, target: { value: '0.27' } })
+  check('首次拖动即预览当前整张卡片；初次焦点切换不打断预览，值仍实时更新',
+    previewActive() && values.at(-1) === 0.27 && listeners.has('pointerup'))
+  listeners.get('pointerup')?.({ pointerId: 9 })
+  check('其它触点抬起不影响正在拖动的卡片', previewActive())
+  listeners.get('pointerup')?.({ pointerId: 8 })
+  check('拖动松手立即恢复，并清理临时窗口监听', previewOff() && listeners.size === 0)
+  input.props.onPointerDown({ currentTarget: slider, button: 0, pointerId: 10 })
+  advanceFrame()
+  input.props.onPointerCancel({ currentTarget: slider, pointerId: 10 })
+  check('触控取消能恢复完整设置界面', previewOff() && listeners.size === 0)
+  input.props.onKeyDown({ currentTarget: slider, key: 'ArrowRight' })
+  check('键盘调整滑条期间也进入预览', previewActive())
+  input.props.onKeyUp({ currentTarget: slider, key: 'ArrowRight' })
+  check('键盘松键后恢复设置界面', previewOff() && listeners.size === 0)
+  input.props.onKeyDown({ currentTarget: slider, key: 'Home' })
+  listeners.get('blur')?.()
+  check('失去窗口焦点后不会留下透明弹窗', previewOff() && listeners.size === 0)
+  input.props.onKeyDown({ currentTarget: slider, key: 'End' })
+  input.props.onKeyDown({ currentTarget: slider, key: 'Escape' })
+  check('Escape 退出预览并允许 DSH 继续处理关闭弹窗', previewOff() && listeners.size === 0)
+  const detachedSlider = { closest: (selector) => selector === '.ds-ts-card' ? {
+    closest: (parent) => parent === '.ds-ts-page' ? { closest: () => null } : null,
+  } : null }
+  input.props.onPointerDown({ currentTarget: detachedSlider, button: 0, pointerId: 11 })
+  check('不在主题工作室弹窗内的滑条不会隐藏其它 DSH 设置', previewOff() && listeners.size === 0)
+  window.addEventListener = oldAdd
+  window.removeEventListener = oldRemove
+  window.requestAnimationFrame = oldFrame
+  window.cancelAnimationFrame = oldCancelFrame
+}
 /* 这里**不能**直接断言「页面文本里没有『侧边栏』三个字」——「边栏」卡片的说明文字
  * 就是「侧边栏与顶边栏，共用一份参数」，那是有意写上去的。所以要判的是
  * 「没有以这两个名字为**标题**的分区卡片」：标题在 DOM 里紧跟在「收起/展开」按钮之后。 */
@@ -483,26 +981,52 @@ check('★ 重置默认只显示按钮（两步确认，不一点就执行）',
   /* 精确到确认问句本身：别的卡片的副标题里就有「确认」二字（自检那张卡是
    * 「确认毛玻璃到底作用到了哪些元素」），用单字判会假失败。 */
   !texts.misc.includes('确认重置全部配置') && !texts.misc.includes('确认清理本地缓存'), texts.misc.slice(0, 220))
-check('★ 重置走宿主 /api/reset，并用返回的出厂配置覆盖本地',
-  source.includes('${API}/reset') && source.includes('purgeFiles') &&
-    /const fresh = result\.body\.config \?\? defaultConfig\(\)/.test(source))
+/* 这两条都基于 codeOnly + 函数体截取：旧版断言用的是含注释的 `source`，
+ * 而注释里恰好留着旧实现 `await putConfig(before)` —— 实现改成 purge-cache 之后
+ * 它仍然「通过」，属于注释替代码背书。 */
+const resetBody = sliceTopLevelBody(codeOnly, 'const resetConfig = async () => {')
+check('★ 重置走宿主 POST /api/reset，并用返回的出厂配置覆盖本地',
+  resetBody !== null && /fetch\(`\$\{API\}\/reset`/.test(resetBody) &&
+    resetBody.includes("method: 'POST'") && resetBody.includes('purgeFiles') &&
+    /const fresh = result\.body\.config \?\? defaultConfig\(\)/.test(resetBody) &&
+    resetBody.includes('runtime.apply(fresh)') && resetBody.includes('setConfig(fresh)'),
+  resetBody === null ? '未截到 resetConfig 函数体' : `len=${resetBody.length}`)
 /* 0.2.5 用户要求：卡片里**只留功能**，别把解释性描述塞进界面。
- * 同时「清理本地缓存」收窄为**只清缓存** —— 它复用 `/api/reset?purgeFiles=true`，
- * 而那个端点会顺带把配置写回出厂，所以必须把当前配置原样写回去，
- * 否则点一下「清理本地缓存」会莫名其妙丢掉全部设置。 */
+ * 同时「清理本地缓存」收窄为**只清缓存** —— 旧实现复用 `/api/reset?purgeFiles=true`，
+ * 而那个端点会顺带把配置写回出厂；新实现改走专用 `/api/purge-cache`。 */
 check('★ 重置卡片只留功能按钮，没有解释性描述段落',
-  !source.includes('这一项不是「卸载插件」') && !source.includes('关闭只是把效果撤掉、配置留着') &&
-    !source.includes("tr('重置并清理数据文件')") && !source.includes("tr('重置并删除插件文件')"))
+  !codeOnly.includes('这一项不是「卸载插件」') && !codeOnly.includes('关闭只是把效果撤掉、配置留着') &&
+    !codeOnly.includes("tr('重置并清理数据文件')") && !codeOnly.includes("tr('重置并删除插件文件')"))
 check('★ 两个按钮是「重置配置」与「清理本地缓存」',
-  source.includes("tr('重置配置')") && source.includes("tr('清理本地缓存')"))
-check('★ 「清理本地缓存」只清缓存：清完必须把当前配置原样写回去',
-  source.includes('const purgeCache = async () =>') && source.includes('const before = runtime.config') &&
-    source.includes('await putConfig(before)'))
+  codeOnly.includes("tr('重置配置')") && codeOnly.includes("tr('清理本地缓存')"))
+
+const purgeBody = sliceTopLevelBody(codeOnly, 'const purgeCache = async () => {')
+const purgeDanglingAt = purgeBody === null ? -1 : purgeBody.indexOf('if (dangling)')
+const purgeBeforeDangling = purgeDanglingAt < 0 ? '' : purgeBody.slice(0, purgeDanglingAt)
+const purgeAfterDangling = purgeDanglingAt < 0 ? '' : purgeBody.slice(purgeDanglingAt)
+/* 当前实现：POST /purge-cache 清副本；唯一会碰配置的分支是「当前/固定壁纸指向
+ * 已被删掉的上传副本」——那时只 patch wallpaper 的 source/current/fixed 三项，
+ * 绝不把清理前的快照整份写回。所以负向断言钉的是「不得整份回写」而不是
+ * 「一个字节都不许写」：后者会与真实实现（悬挂选择的局部 persist）冲突。 */
+check('★ 「清理本地缓存」走 POST /api/purge-cache，不再借道 /api/reset 或 purgeFiles',
+  purgeBody !== null && /fetch\(`\$\{API\}\/purge-cache`/.test(purgeBody) &&
+    purgeBody.includes("method: 'POST'") &&
+    !purgeBody.includes('${API}/reset') && !purgeBody.includes('purgeFiles'),
+  purgeBody === null ? '未截到 purgeCache 函数体' : `len=${purgeBody.length}`)
+check('★ 「清理本地缓存」不得把配置快照整份写回（只在悬挂选择时做局部清理）',
+  purgeBody !== null && !purgeBody.includes('putConfig') &&
+    !/(?:putConfig|setConfig|persist|flushConfig|replaceConfig)\(\s*(?:\.\.\.)?before\b/.test(purgeBody) &&
+    !/runtime\.config\s*=\s*before\b/.test(purgeBody) &&
+    !/putConfig|setConfig|persist|flushConfig|replaceConfig/.test(purgeBeforeDangling) &&
+    purgeAfterDangling.includes('persist({ wallpaper:'),
+  purgeBody === null
+    ? '未截到 purgeCache 函数体'
+    : `悬挂前写入=${(purgeBeforeDangling.match(/[^\n]*(?:putConfig|setConfig|persist|flushConfig|replaceConfig)[^\n]*/g) ?? []).join(' | ') || '(无)'}；悬挂后 persist=${purgeAfterDangling.includes('persist({ wallpaper:')}`)
 check('★ 非 JSON 响应要能翻译成人话（本轮报障的回归点）',
-  source.includes('async function readJsonResponse') && source.includes('function describeHostFailure') &&
-    !/await response\.json\(\)/.test(source))
+  codeOnly.includes('async function readJsonResponse') && codeOnly.includes('function describeHostFailure') &&
+    !/await response\.json\(\)/.test(codeOnly))
 check('★ 404（宿主还没重启）的提示里要说清「重启 dsh web」',
-  source.includes('宿主没有这个接口') && source.includes('重启 dsh web'))
+  codeOnly.includes('宿主没有这个接口') && codeOnly.includes('重启 dsh web'))
 check('面板不含英文界面词', !/\b(Wallpaper|Glass|Theme color|Master switch|Source|Opacity|Enable)\b/.test(
   Object.values(texts).join(' '),
 ))
@@ -510,29 +1034,22 @@ check('面板不含英文界面词', !/\b(Wallpaper|Glass|Theme color|Master swi
 /* 静态检查：控件确实在源码里被使用、且文案是中文。
    这里刻意不逐个数渲染出的控件数量 —— 那依赖 state 桩的精确行为，
    假失败会掩盖真问题；要抓的是「整块渲染抛错」这类致命问题，上面的渲染断言已经覆盖。
-   注意：`source`（bundle 源码）在文件开头就已读入。 */
-check('候选缩略图带悬停删除按钮', source.includes('ds-ts-thumb-del') && source.includes("'✕'"))
+   注意：静态断言一律读文件开头构造的 `codeOnly`（已剔除注释的代码投影）。它保留
+   字符串与模板字符串里的界面文案，但不再接受注释里的字样 —— 注释不能替代码背书。 */
+check('候选缩略图带悬停删除按钮', codeOnly.includes('ds-ts-thumb-del') && codeOnly.includes("'✕'"))
 /* 0.2.0：删除语义按来源分三种，aria-label 必须给出真实语义。
- * ⚠️ 这条断言读的是 **bundle 源码（含注释）** —— 上一版把「文件夹来源只从候选墙移除」
- * 这句话写进了注释，于是旧文案被注释里的字样**假通过**了。改断言时顺手把注释里的
- * 旧字样也换掉，别让注释替代码背书。 */
+ * ⚠️ 这条断言读的是 **codeOnly（剔除注释后的代码投影）** —— 上一版曾让注释里
+ * 出现的同款文案替代码「作证」，属于假通过；改后只认代码里的字符串字面量。 */
 check('删除文案按来源区分：上传的图是真删、登记目录里的原图只移出视图',
-  source.includes("tr('删除这张上传的图')") && source.includes("tr('从候选墙移除')") &&
-    !source.includes("tr('移出候选')") && !source.includes("tr('恢复已移除')"))
-check('三个分区都有滑块控件', ['不透明度', '模糊'].every((label) => source.includes(`tr('${label}')`)))
-check('R/G/B 滑块标签存在', source.includes("['R 红', 'G 绿', 'B 蓝']"))
+  codeOnly.includes("tr('删除这张上传的图')") && codeOnly.includes("tr('从候选墙移除')") &&
+    !codeOnly.includes("tr('移出候选')") && !codeOnly.includes("tr('恢复已移除')"))
+check('三个分区都有滑块控件', ['不透明度', '模糊'].every((label) => codeOnly.includes(`tr('${label}')`)))
+check('R/G/B 滑块标签存在', codeOnly.includes("['R 红', 'G 绿', 'B 蓝']"))
 
 /* 回归（0.1.11）：设置界面上不再有「画质档位」，也不再有每分区的「饱和度」滑块。
  * 注意两点：
  *   ·「饱和度」三个字在壁纸页仍然合法（那是给壁纸本身调色的），所以只断言**玻璃路径**；
- *   · 注释里刻意留着「已移除」的历史说明，因此判定要先把注释行剔掉再搜。 */
-const codeOnly = source
-  .split('\n')
-  .filter((line) => {
-    const trimmed = line.trim()
-    return !trimmed.startsWith('//') && !trimmed.startsWith('*') && !trimmed.startsWith('/*')
-  })
-  .join('\n')
+ *   · 注释里刻意留着「已移除」的历史说明，因此判定统一用文件开头构造的 `codeOnly`。 */
 
 check('不再读写每分区的 glass.*.saturation',
   !codeOnly.includes('${region.key}.saturation') && !codeOnly.includes('glass.${region.key}.saturation'),
@@ -558,17 +1075,18 @@ check('分区模糊滑块用上限常量而不是硬编码 40',
   codeOnly.includes('max: MAX_BLUR') && !/label: tr\('模糊'\)[\s\S]{0,120}max: 40/.test(codeOnly))
 
 /* 回归：一律不得使用原生 title —— 那会弹出浏览器自带的文件名提示，纯插件侧无法拦截。 */
-check('缩略图不再使用原生 title 提示', !/'title':/.test(source) && !/^\s*title: name/m.test(source))
-check('删除按钮不再使用原生 title 提示', !/title: label/.test(source))
+check('缩略图不再使用原生 title 提示', !/'title':/.test(codeOnly) && !/^\s*title: name/m.test(codeOnly))
+check('删除按钮不再使用原生 title 提示', !/title: label/.test(codeOnly))
 /* 用户明确要求：悬停 ✕ 时不显示任何文字，所以自绘气泡也一并去掉。 */
-check('删除按钮悬停不再显示文字气泡', !source.includes('ds-ts-thumb-tip') && !/role: 'tooltip'/.test(source))
+check('删除按钮悬停不再显示文字气泡', !codeOnly.includes('ds-ts-thumb-tip') && !/role: 'tooltip'/.test(codeOnly))
 /* 回归：删除按钮里不能再塞文案 —— 缩略图的 overflow:hidden 会把它裁掉（实测只剩「移」）。 */
-check('删除按钮内不放文案', !source.includes('ds-ts-thumb-del-text'))
+check('删除按钮内不放文案', !codeOnly.includes('ds-ts-thumb-del-text'))
 /* 回归：文件名角标必须用专属类名。写通配的 `.ds-ts-thumb span` 会把删除按钮内部的
    文案 span 一起拉成整行，文字溢出、按钮看起来「偏出去」。
-   判定方式：只认「真的是一条 CSS 规则」的行（同一行里出现 { 且以 } 结束），
-   这样修复说明的注释（会引用这条旧选择器）不会自指误报。 */
-const cssRuleLines = source.split('\n').filter((line) => line.includes('{') && line.trimEnd().endsWith('}'))
+   判定方式：在 codeOnly（JS 注释已剔除）上只认「真的是一条 CSS 规则」的行
+   （同一行里出现 { 且以 } 结束）。CSS 写在模板字符串里，那段注释属于字符串内容，
+   所以还要这层行形状过滤，修复说明里引用的旧选择器才不会自指误报。 */
+const cssRuleLines = codeOnly.split('\n').filter((line) => line.includes('{') && line.trimEnd().endsWith('}'))
 check('文件名角标使用专属类名（不再通配 span）',
   cssRuleLines.some((line) => line.includes('.ds-ts-thumb-name {')) &&
     !cssRuleLines.some((line) => line.includes('.ds-ts-thumb span {')))
@@ -606,16 +1124,19 @@ const noRemovedCss = moduleExports.buildCss(allGlassy)
  *   · 不需要 :has() 让位规则 —— 伪元素方案从结构上就不产生包含块。 */
 check('边栏：膜与模糊都落在 ::before 上',
   /\] \.hHd-Xa_root::before,/.test(noRemovedCss) && /\] \.wSkVaW_header::before \{/.test(noRemovedCss))
+check('顶边栏单独隔离负层玻璃膜，侧栏不隔离以免困住设置弹窗',
+  noRemovedCss.includes('] .wSkVaW_header { isolation: isolate; }') &&
+    !noRemovedCss.includes('] .hHd-Xa_root { isolation: isolate; }'))
 check('边栏：伪元素同时带 background-color 与 backdrop-filter',
   /\.hHd-Xa_root::before,[\s\S]*?background-color: var\(--ds-ts-bars\)[\s\S]*?backdrop-filter: blur\(20px\)/.test(noRemovedCss))
 check('边栏：元素自身没有 backdrop-filter（否则会困住设置弹窗）',
   !/\] \.(?:hHd-Xa_root|wSkVaW_header) \{[^}]*backdrop-filter/.test(noRemovedCss))
-check('边栏：剥掉侧栏外侧那层实色（否则伪元素采到的是平色）',
-  noRemovedCss.includes('.pI_x6G_sidebarCol { background: transparent !important; }'))
+check('无壁纸时侧栏外层直接绘制遮罩，避免负层伪元素被框架白底遮住',
+  noRemovedCss.includes('.pI_x6G_sidebarCol { background: var(--ds-ts-bars) !important; }'))
 /* ★ 侧栏实色的第三个来源：会话列表底部的渐隐遮罩消费同一个 token（0.1.17）。 */
 check('★ 边栏：sidebar-fill 在侧栏内被就地覆盖为透明，且没有写到全局',
   noRemovedCss.includes('] .hHd-Xa_root { --dsw-specific-sidebar-fill: transparent !important; }') &&
-    !/body \{[^}]*--dsw-specific-sidebar-fill/.test(noRemovedCss))
+    !/body \{[^}]*--dsw-specific-sidebar-fill\s*:/.test(noRemovedCss))
 check('边栏：没有 :has() 让位规则（伪元素方案不需要）',
   !noRemovedCss.includes(':has(.VOzbGW_overlay)'))
 /* ★ 真实故障的回归点（0.1.16）：元素自身带 z-index 会创建层叠上下文，
@@ -626,7 +1147,7 @@ check('★ 边栏：元素自身不加 z-index，壁纸层改为 -2',
 check('边栏：没有回到旧的 --ds-ts-topbar / --ds-ts-sidebar 变量命名',
   noRemovedCss.includes('--ds-ts-bars') && !noRemovedCss.includes('--ds-ts-topbar') &&
     !noRemovedCss.includes('--ds-ts-sidebar'))
-check('边栏已覆盖 --dsw-specific-sidebar-fill 之外的路径（侧栏两层实色都剥掉）',
+check('边栏已覆盖 --dsw-specific-sidebar-fill 之外的路径（外层及内层都受控）',
   noRemovedCss.includes('.pI_x6G_sidebarCol') && noRemovedCss.includes('.hHd-Xa_root'))
 
 /* ── 对话区（0.1.13 删） ──
@@ -639,10 +1160,17 @@ check('全部分区开到半透明时 CSS 仍不含 .wSkVaW_root 选择器',
 check('不再生成顶边栏时代的老变量 --ds-ts-topbar', !noRemovedCss.includes('--ds-ts-topbar'))
 
 /* ── 设置界面（0.1.14 删） ──
- * 除了元素选择器，它还绑过三条 token，一并断言。 */
-check('全部分区开到半透明时 CSS 仍不含 .VOzbGW_panel / .VOzbGW_mask 选择器',
-  !noRemovedCss.includes('.VOzbGW_panel') && !noRemovedCss.includes('.VOzbGW_mask'),
-  (noRemovedCss.match(/\.VOzbGW_\S*/g) ?? []).join(',') || '(无)')
+ * 当前菜单规则会在 :not() 中引用设置面板与浮层以排除其子树；引用不等于命中。
+ * 断言设置界面只以排除条件出现，不复活设置分区或设置遮罩的规则。 */
+const panelRules = [...noRemovedCss.matchAll(/([^{}]+)\{[^{}]*\}/g)]
+  .map(([, selector]) => selector.trim())
+  .filter((selector) => selector.includes('.VOzbGW_panel'))
+check('全部分区半透明时设置面板仅在菜单排除条件里出现，遮罩不被接管',
+  panelRules.length > 0 && panelRules.every((selector) =>
+    selector.includes(':not(.VOzbGW_panel *, .VOzbGW_overlay *)') &&
+      !selector.includes('] .VOzbGW_panel') && !selector.includes('] .VOzbGW_overlay')) &&
+    !noRemovedCss.includes('.VOzbGW_mask'),
+  panelRules.map((selector) => selector.slice(0, 120)).join(' | ') || '(无)')
 check('不再生成设置界面专用变量 --ds-ts-panel', !noRemovedCss.includes('--ds-ts-panel'))
 check('不再接管设置遮罩的模糊 --dsw-mask-blur', !noRemovedCss.includes('--dsw-mask-blur'))
 check('--dsw-alias-bg-layer-1 与 --dsw-alias-bg-overlay 已还给 DSH 原生',

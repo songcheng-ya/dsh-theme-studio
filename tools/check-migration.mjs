@@ -21,8 +21,8 @@ const check = (label, ok, detail) => {
   if (!ok) process.exitCode = 1
 }
 
-/** 当前仍然存在的分区（`chat` 0.1.13 / `panel` 0.1.14 删；
- *  `sidebar` + `topbar` 0.1.15 合并重写为 `bars`）。 */
+/** 旧版本已有、迁移时需要重置的四个分区；新增的 assistant 不在旧配置中，
+ * 由 readConfig 的默认值合并补齐。 */
 const REGIONS = ['bars', 'input', 'bubble', 'menu']
 /** 已经整体删除的分区：旧配置里会留着，必须被剔除。 */
 const RETIRED_REGIONS = ['sidebar', 'topbar', 'chat', 'panel']
@@ -66,6 +66,9 @@ const legacy = {
 
 const fresh = host.defaultConfig()
 const migrated = host.migrateConfig(legacy)
+check('旧配置没有 AI 回复参数时，新分区默认开启且不透明/不模糊',
+  migrated.glass.assistant === undefined &&
+    fresh.glass.assistant.enabled === true && fresh.glass.assistant.opacity === 1 && fresh.glass.assistant.blur === 0)
 
 check(`版本升级到 ${fresh.version}`, migrated.version === fresh.version, String(migrated.version))
 
@@ -146,8 +149,9 @@ check('dropRetiredKeys 对缺失/异常结构容错', dropSafe)
  * 这两个是**参数**级的废弃，不是分区级的：分区还在，只是字段没了。
  * 同样靠 dropRetiredKeys 清理。 */
 check(
-  '出厂默认每个分区都只剩 enabled/opacity/blur',
-  REGIONS.every((key) => Object.keys(fresh.glass[key]).sort().join(',') === 'blur,enabled,opacity'),
+  '出厂默认每个分区都只含 enabled/opacity/blur/color，且颜色跟随主题',
+  [...REGIONS, 'assistant'].every((key) =>
+    Object.keys(fresh.glass[key]).sort().join(',') === 'blur,color,enabled,opacity' && fresh.glass[key].color === 'auto'),
   REGIONS.map((key) => `${key}:${Object.keys(fresh.glass[key]).join('/')}`).join('  '),
 )
 check(

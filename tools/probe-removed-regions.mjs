@@ -62,18 +62,16 @@ const check = (label, ok, detail) => {
  * `expect` 决定「与原生逐项一致」这条硬断言要不要下：
  *   - `identical`（默认）：插件规则不命中它，且它的计算样式与原生逐项一致。
  *   - `rules-only`：只要求「插件规则不命中它 + 内部没有 backdrop-filter」。
- *     用于那些**底色由别的分区/全局 token 顺带决定**的分区。设置弹窗就是这种：
- *     `.VOzbGW_panel { background: var(--dsw-alias-bg-layer-2) }`，而 layer-2 归
- *     「弹层菜单」分区管 —— 所以把菜单不透明度调低，设置弹窗会跟着变透明。
- *     那是 DSH 原生的令牌用法，不是「设置界面分区没删干净」，不该判 FAIL，
- *     但必须**显式打印出来**，免得下次又被当成残留。 */
+ *     用于仍会受**其它全局效果**影响的分区，不能断言整个子树逐项一致。
+ *     设置弹窗读取原生 `--dsw-alias-bg-layer-2`；菜单令牌现在只在弹窗外
+ *     的菜单元素上覆盖。其底色必须与插件关闭时一致，下面单独断言。 */
 const REMOVED = [
   { key: 'chat', zh: '对话区', selector: '.pI_x6G_centerCol', scope: 'self' },
   { key: 'panel', zh: '设置界面', selector: '.VOzbGW_panel', scope: 'subtree', when: 'dialog', expect: 'rules-only' },
 ]
 /** 每个现存分区各自的一条代表性选择器（用来做「还没删光」的反向保险）。
  *  `bars` 在 0.1.15 重新接管了侧栏与顶边栏，所以它们现在也算「现存」。 */
-const LIVE_MARKERS = ['hHd-Xa_root', 'wSkVaW_header', 'uV2eYG_card', 'Sixlwa_bubble', 'bRhRbq_panel']
+const LIVE_MARKERS = ['hHd-Xa_root', 'wSkVaW_header', 'uV2eYG_card', 'Sixlwa_bubble', 'assistant-step', 'bRhRbq_panel']
 
 /* ── 浏览器 ─────────────────────────────────────────────────────── */
 
@@ -382,7 +380,7 @@ for (const region of REMOVED) {
   check(`${region.zh}元素数量一致（结构未变）`, a.nodeCount === b.nodeCount, `${a.nodeCount} vs ${b.nodeCount}`)
   check(`${region.zh}范围内没有任何元素带 backdrop-filter`, b.blurs === 0, `${b.blurs} 个`)
   const rulesOnly = region.expect === 'rules-only'
-  if (!rulesOnly) {
+  if (!rulesOnly || region.key === 'panel') {
     check(`${region.zh}底色未被插件改写`, a.backgroundSample === b.backgroundSample,
       `${a.backgroundSample} vs ${b.backgroundSample}`)
   } else if (a.backgroundSample !== b.backgroundSample) {
@@ -444,17 +442,15 @@ for (const region of REMOVED) {
     }
   }
 
-  /* 硬判定：**分区自身那一级**不得被任何插件规则命中 —— 这是「这个分区的代码真的没了」的
-   * 唯一可靠判据。至于「自身底色与原生一致」，对 `rules-only` 的分区不能要求：
-   * 它的底色本来就可能由别的分区/全局 token 决定（设置弹窗跟随 --dsw-alias-bg-layer-2），
-   * 而那一级自己命中的插件规则恰好是「(无)」，正好证明差异不是它带来的。 */
+   /* 硬判定：**分区自身那一级**不得被任何插件规则命中。设置弹窗的底色
+    * 另与原生基线比较；其它公共效果仍可能使 rules-only 的子树样式不同。 */
   const selfBefore = a.find((item) => item.isSelf)
   const selfAfter = b.find((item) => item.isSelf)
   check(`${region.zh}自身那一级没有被任何插件规则命中`,
     selfAfter.matched.length === 0, selfAfter.matched.join(' | ') || '(无)')
   if (region.expect === 'rules-only') {
     console.log(`  说明：${region.zh}自身底色 ${selfBefore.bg} → ${selfAfter.bg}，` +
-      '但命中它的插件规则为「(无)」，差异来自祖先 / 其他分区的 token，不是本分区的残留')
+      '自身没有被插件规则命中；底色必须保持原生，其他差异需另行核查')
   } else {
     check(`${region.zh}自身的底色/图层/模糊与原生一致`,
       selfBefore.bg === selfAfter.bg && selfBefore.bgImage === selfAfter.bgImage && selfBefore.backdrop === selfAfter.backdrop,
@@ -524,21 +520,12 @@ check('设置遮罩铺满视口',
     Math.abs(glassTab.maskRect[2] - glassTab.viewport[0]) <= 2 && Math.abs(glassTab.maskRect[3] - glassTab.viewport[1]) <= 2,
   JSON.stringify(glassTab.maskRect))
 
-/* 设置界面分区删掉之后：
- *   · 面板不再有插件写入的底色或 backdrop-filter —— 它现在只有一个底色来源，
- *     就是 `--dsw-alias-bg-layer-2`，而 layer-2 归「弹层菜单」分区管。
- *     所以这一次快照里（menu 被强制成 0.5）面板必须是 0.5；
- *     用户自己的配置里 menu 是不透明度 1，面板就是完全不透明的白。 */
+/* 设置面板读取原生 bg-layer-2；菜单参数强制成 0.5 后，它仍须和插件关闭
+ * 的基线同色。菜单令牌只作用于设置面板外的菜单，不能再泄漏到 body。 */
 const panelBg = String(glassTab.panelStyle?.backgroundColor ?? '')
-const panelAlpha = (() => {
-  const m = /rgba?\(([^)]+)\)/.exec(panelBg)
-  if (!m) return null
-  const parts = m[1].split(/[\s,/]+/).filter(Boolean).map(Number)
-  return parts.length >= 4 ? parts[3] : 1
-})()
-const fixtureMenuOpacity = allOn.menu.opacity
-check('设置面板底色只跟随「弹层菜单」的 layer-2 令牌（本次强制 0.5）',
-  panelAlpha === fixtureMenuOpacity, `${panelBg} → alpha=${panelAlpha}，menu fixture opacity=${fixtureMenuOpacity}`)
+const nativePanelBg = base.dialog.regions.panel.backgroundSample
+check('设置面板底色保持 DSH 原生，不再跟随弹层菜单不透明度',
+  panelBg === nativePanelBg, `${nativePanelBg} → ${panelBg}（菜单不透明度 ${allOn.menu.opacity}）`)
 check('设置面板自身没有 backdrop-filter（分区删掉后不再有任何模糊）',
   String(glassTab.panelStyle?.backdropFilter) === 'none', String(glassTab.panelStyle?.backdropFilter))
 check('设置遮罩没有被插件接管模糊（--dsw-mask-blur 回到 DSH 原生值）',
